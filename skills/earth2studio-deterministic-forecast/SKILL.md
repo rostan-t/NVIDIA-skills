@@ -1,6 +1,6 @@
 ---
 name: earth2studio-deterministic-forecast
-version: 0.16.0
+version: 1.0.0
 license: Apache-2.0
 metadata:
   author: NVIDIA Earth-2 Team
@@ -12,233 +12,289 @@ metadata:
     - forecast
     - deterministic
 description: >
-  Build deterministic forecast scripts with Earth2Studio (model, data source,
-  IO, inference). Do NOT use for ensemble, diagnostics, data-only fetch, or
-  install.
+  Use when building Earth2Studio single-member forecast scripts, including
+  diagnostic postprocessing of forecast fields with Pipeline. Do NOT use for
+  ensembles, standalone diagnostics, data-only fetch, or installation.
 ---
 
 # Earth2Studio Deterministic Forecast Skill
 
-## Purpose
-
 Guide users through building deterministic (single-member) weather forecast
-inference scripts with Earth2Studio. Covers model selection, data source
-compatibility, IO backend choice, nsteps calculation, and generating a
-complete script following `earth2studio.run.deterministic`.
+inference scripts with `earth2studio.run.deterministic`, or with `Pipeline` when
+they need diagnostic postprocessing, multiple initial times, resume, or several
+output streams.
 
 ## Prerequisites
 
-- Earth2Studio installed (`pip install earth2studio` or `uv add earth2studio`)
-- CUDA-capable GPU with sufficient VRAM for the chosen model
-- Network access for model weight download and data fetching
-- Python 3.10+
+- Earth2Studio installed with extras for the prognostic and any diagnostic (see
+  `earth2studio-install`; it owns Python version, extras, and environment setup)
+- A CUDA-capable GPU for nearly all models (`deterministic` falls back to CPU when
+  CUDA is unavailable, which is rarely practical)
+- Network access for model weights and data
 
-## Instructions
+## Where to look
 
-You are helping a user build a deterministic forecast inference script
-using Earth2Studio. The script follows the structure of
-`earth2studio.run.deterministic` — a pipeline that takes a prognostic
-model, fetches initial conditions from a data source, steps the model
-forward, and writes output to an IO backend.
+Models, data sources, and APIs change between releases. Read these instead of
+recalling them, and cite what you used.
 
-## Core principle: live docs drive every recommendation
+Use the selected version's [model contract](../../docs/specs/E2S-06_MODEL_CONTRACT_SPEC.md),
+[execution contract](../../docs/specs/E2S-11_EXECUTION_CONTRACT_SPEC.md) and
+[IO specification](../../docs/specs/E2S-10_IO_SPEC.md) as the source of truth.
+Consult these directly for behavior requirements; examples below do not define a separate contract.
 
-Model availability, data source APIs, and IO backends change between
-releases. Before recommending any component, fetch the relevant live
-doc page to confirm it exists and check its current interface.
+| Need | Where to look (repo path first, live page as a fallback) |
+|------|------------------------------------------------|
+| Prognostic models and their badges (region, VRAM, class) | `docs/modules/models_px.md` |
+| What a model needs and how it steps | the model class in `earth2studio/models/px/`: `input_coords()`, `output_coords()`, `forcing_coords()`, `default_sources()` |
+| Diagnostic inputs, outputs, grid, and loading | `docs/modules/models_dx.md`, the class in `earth2studio/models/dx/`, and `earth2studio/models/dx/base.py` |
+| Data sources | `docs/modules/datasources_analysis.md`, `datasources_forecast.md`, and `earth2studio/lexicon/` |
+| IO backends | `earth2studio/io/` (`ZarrBackend`, `NetCDF4Backend`, `XarrayBackend`, `AsyncZarrBackend`, `KVBackend`, ...) |
+| The built-in workflow | `deterministic` in `earth2studio/run/__init__.py` |
+| Forecast + diagnostics, multi-time, resumable runs | `Pipeline.from_model`, `PrognosticRunner`, `work_items`, `ProgressStore` in `earth2studio/run/` |
+| Worked example | `examples/01_getting_started/01_deterministic_workflow.py` |
+| Pipeline streams, filtering, regridding, resume | [Execution specification](../../docs/specs/E2S-11_EXECUTION_CONTRACT_SPEC.md#pipeline) |
+| What changed from 0.x | `MIGRATION.md` |
 
-Live doc references (fetch only what the current step requires):
+Live pages (note the `/main/` segment; URLs without it return 404):
 
-| Component | URL |
-|-----------|-----|
-| Prognostic models | <https://nvidia.github.io/earth2studio/modules/models_px.html> |
-| Data sources (analysis) | <https://nvidia.github.io/earth2studio/modules/datasources_analysis.html> |
-| Data sources (forecast) | <https://nvidia.github.io/earth2studio/modules/datasources_forecast.html> |
-| IO backends | <https://nvidia.github.io/earth2studio/modules/io.html> |
-| `run.deterministic` source | <https://github.com/NVIDIA/earth2studio/blob/main/earth2studio/run.py> |
-| Lexicon (variable compat) | <https://github.com/NVIDIA/earth2studio/tree/main/earth2studio/lexicon> |
+```text
+https://nvidia.github.io/earth2studio/main/modules/models_px/
+https://nvidia.github.io/earth2studio/main/modules/models_dx/
+https://nvidia.github.io/earth2studio/main/modules/datasources_analysis/
+https://nvidia.github.io/earth2studio/main/modules/datasources_forecast/
+https://nvidia.github.io/earth2studio/main/modules/io/
+https://nvidia.github.io/earth2studio/main/examples/
+```
 
-## Interaction protocol
+## Workflow
 
-### Step 1. Understand forecast requirements
+### 1. Gather requirements (skip what's already provided)
 
-Ask the user (cap at 3 questions, skip what's already answered):
+- Time horizon (hours/days/weeks) and initialization time(s)
+- Variables of interest (t2m, wind, geopotential, etc.)
+- Diagnostic model or derived product, if requested; save forecast, diagnostics,
+  or both, and at what output resolution?
+- Region (global or specific like CONUS)
+- GPU/VRAM available for the prognostic and diagnostics together
 
-1. **Time horizon** — how far ahead? Hours (nowcast), days
-   (medium-range), weeks/months (seasonal)?
-2. **Variables of interest** — what do they want to predict?
-   (temperature, wind, geopotential, precipitation, etc.)
-3. **Region** — global or regional (e.g. CONUS for HRRR-based models)?
-4. **Hardware** — what GPU / VRAM do they have? (filters model choices)
+### 2. Select a model
 
-### Step 2. Select prognostic model
+Read the prognostic models page and filter by horizon, region, and VRAM. From the
+model class, note:
 
-Fetch the prognostic models page. Filter candidates by:
+- Input variables: `model.input_coords().coords["variable"]`
+- Step size: the model's output `lead_time` step. Read it from
+  `output_coords(input_coords())` rather than assuming 6 h.
+- Forcing slots: if `forcing_coords()` is non-empty, the model needs extra data
+  (for example static fields or time-varying forcing) that `run.deterministic`
+  does not supply. Use `Pipeline.from_model` or the manual loop for those.
 
-- **Time horizon** → model class badge (NWC, MR, S2S, CM)
-- **Region** → region badge (Global, NA, etc.)
-- **VRAM** → rec VRAM badge
-- **Variables** → check model's `input_coords`/`output_coords` against what the user needs
+For diagnostic postprocessing, compare the prognostic's output signature with
+the diagnostic's `input_coords()`: required variables and order, units/statistics,
+grid/domain, and temporal dimensions must be compatible. Inspect the diagnostic's
+`output_coords(...)` and loading arguments too. The built-in `PrognosticRunner`
+path handles a single prognostic input/output and single-input, single-output
+diagnostics. Multi-slot models need an explicit runner or coupling workflow.
+Each diagnostic receives the forecast, not the preceding diagnostic's output.
 
-Present 2–4 candidate models with tradeoffs (resolution, speed, accuracy, VRAM). Let the user choose.
+### 3. Select a data source
 
-Once selected, note the model's:
+Start from `model.default_sources()`: it lists the model's recommended source for
+each input slot (and forcing slot), or `None` if there is no recommendation. Use
+a different source only if the user asks or the recommendation is unsuitable. Any
+source must provide every input variable, so check its lexicon in
+`earth2studio/lexicon/` (`VOCAB` keys). Regional models need a data source that
+covers their region.
 
-- Required input variables (from `input_coords["variable"]`)
-- Time step size (from `output_coords["lead_time"]`)
-- These determine `nsteps` and constrain which data sources work
+`Pipeline.from_model` uses recommended sources when `source`/`forcing` are
+omitted; otherwise pass one source per prognostic forcing slot as a tuple.
+Diagnostics in this pipeline consume forecast fields, not their own data sources.
+For off-grid source data, use `RegriddedSource` with a suitable regridder before
+model inference; output regridding does not fix model input compatibility.
 
-### Step 3. Select data source
+### 4. Select an IO backend
 
-The data source must provide the model's required input variables. Fetch
-the analysis data source page (or forecast source page if comparing
-against operational forecasts).
+Default: `ZarrBackend`. Use `NetCDF4Backend` for legacy tools and `XarrayBackend`
+for in-memory or small runs. IO backends are created from an output template and
+do not grow afterwards. `deterministic` and `Pipeline` build the template for you;
+only a manual loop has to.
 
-Verify compatibility:
+### 5. Calculate nsteps
 
-1. Fetch the candidate source's lexicon from
-   `earth2studio/lexicon/<source>.py`
-2. Confirm all variables in the model's `input_coords["variable"]`
-   exist as keys in the source's VOCAB
+`nsteps = forecast_hours // model_step_hours`. A 5-day forecast with a 6 h step
+gives `nsteps = 120 // 6 = 20`. Require an exact multiple rather than silently
+truncating the requested horizon. The simple `deterministic` workflow writes
+the initial condition at lead zero plus the forecast steps. Pipeline lead-zero
+availability depends on the model signatures (section 8).
 
-Present viable options. Common pairings:
+### 6. Decide whether to filter output
 
-- Global models (AIFS, Pangu, GraphCast, SFNO, etc.) →
-  GFS, ARCO, CDS, WB2ERA5, IFS
-- Regional models (StormCast, HRRR-based) → HRRR
-- Historical/research runs → ARCO, CDS, WB2ERA5, NCAR_ERA5
+- For `deterministic`, pass `output_coords` when the user asks for specific
+  variables. It remains a dictionary of coordinate subsets in this workflow.
+- For `Pipeline`, use per-stream `output_variables` and `regridder` (section 8).
+  Keep all diagnostic inputs until diagnostics have run.
+- Omit variable filtering to save all variables in each selected output stream.
 
-Let the user choose. Confirm the initialization time(s) they want to forecast from.
-
-### Step 4. Select IO backend
-
-Present the available IO backends (fetch the IO page to confirm current list):
-
-| Backend | Best for |
-|---------|----------|
-| ZarrBackend | Large outputs, chunked storage, recommended default |
-| AsyncZarrBackend | Same as Zarr but async writes for performance |
-| NetCDF4Backend | Compatibility with legacy tools |
-| XarrayBackend | In-memory, small runs, interactive exploration |
-| KVBackend | Key-value dict, debugging |
-
-Recommend ZarrBackend unless the user has a specific reason for another. Ask where they want output saved.
-
-### Step 5. Determine nsteps
-
-Calculate `nsteps` from:
-
-- User's desired forecast horizon (e.g. 5 days)
-- Model's time step (e.g. 6 hours for most global models)
-- `nsteps = forecast_hours / model_step_hours`
-
-Confirm with the user: *"For a 5-day forecast with a 6-hour time step, that's 20 steps. Correct?"*
-
-### Step 6. Generate the inference script
-
-Write a complete Python script following the `earth2studio.run.deterministic` pattern. The script structure:
+### 7. Generate the script
 
 ```python
-import datetime
 from collections import OrderedDict
 
 import numpy as np
 import torch
 
-from earth2studio.models.px import <ModelClass>
 from earth2studio.data import <DataSourceClass>
 from earth2studio.io import <IOBackendClass>
+from earth2studio.models.px import <ModelClass>
 from earth2studio.run import deterministic
 
-# 1. Initialize model
 model = <ModelClass>.load_model(<ModelClass>.load_default_package())
-
-# 2. Initialize data source
 data = <DataSourceClass>()
-
-# 3. Initialize IO backend
 io = <IOBackendClass>("<output_path>")
 
-# 4. (Optional) Subselect output variables/coords
-output_coords = OrderedDict({
-    "variable": np.array(["t2m", "u10m", ...]),  # only save these
-})
+# Include output_coords ONLY if the user requested specific variables
+output_coords = OrderedDict({"variable": np.array(["t2m", "u10m"])})
 
-# 5. Run deterministic forecast
 io = deterministic(
     time=["YYYY-MM-DDTHH:MM:SS"],
     nsteps=<N>,
     prognostic=model,
     data=data,
     io=io,
-    output_coords=output_coords,  # optional
+    output_coords=output_coords,  # omit to save all variables
     device=torch.device("cuda"),
 )
-
-# 6. Post-run: inspect results
-print("Forecast complete. Output at: <output_path>")
 ```
 
-**Before writing the script**, fetch the specific model's doc page
-to confirm:
+Check the model class docstring for `load_model` arguments; some models take
+options, and constructor arguments differ between models. The output store is
+readable afterwards (for Zarr, `xr.open_zarr(...)`). Zarr stores each weather
+variable as a separate array with dimensions `time, lead_time, ...`.
 
-- The correct class import path
-- How to load the model (`load_model` + `load_default_package()`
-  is the standard pattern but verify)
-- Any model-specific constructor arguments
+### 8. Pipeline for diagnostics and larger runs
 
-Also fetch the data source's doc page to confirm constructor arguments
-(some need cache paths, tokens, etc.).
+Use `Pipeline` instead of `deterministic` when the user wants several initial
+times, resume after failure, per-stream variable filtering or regridding,
+diagnostics alongside the forecast, or multi-GPU runs. The 1.0.0-rc API uses
+`Pipeline.from_model(..., diagnostics={stream_name: diagnostic})`, which wraps
+`PrognosticRunner`. Read these classes and `work_items` for the installed version.
 
-### Step 7. Explain the script and next steps
+Example: FCN plus PrecipitationAFNO for 48 hours, with separate forecast and
+precipitation stores. Their grids match and FCN supplies the diagnostic's 20
+input variables. Install both model extras and configure FCN's recommended
+source (`NCAR_ERA5` in this checkout) before running:
 
-After delivering the script, explain:
+```python
+import numpy as np
 
-- How to change the forecast time (just edit the `time` list)
-- How to run multiple initializations (add more entries to `time`)
-- How to subset output variables via `output_coords`
-- Where the output is saved and how to read it back
-  (e.g. `xr.open_zarr(...)`)
-- If they want to add diagnostics on top, point them to the
-  `diagnostic` workflow pattern
+from earth2studio.io import ZarrBackend
+from earth2studio.models.dx import PrecipitationAFNO
+from earth2studio.models.px import FCN
+from earth2studio.run import Pipeline, work_items
 
-## Ownership and out-of-scope
+model = FCN.load_model(FCN.load_default_package())
+precip = PrecipitationAFNO.load_model(PrecipitationAFNO.load_default_package())
+items = work_items(
+    [np.datetime64("2024-01-01T00:00:00")],
+    final_lead_time=np.timedelta64(48, "h"),
+)
+Pipeline.from_model(
+    model,
+    diagnostics={"precipitation": precip},
+    output={
+        "forecast": ZarrBackend("forecast.zarr"),
+        "precipitation": ZarrBackend("precipitation.zarr"),
+    },
+    output_variables={"forecast": ["t2m", "u10m", "v10m"]},
+    device="cuda",
+).run(items)
+```
 
-**Owns:** prognostic model selection for deterministic forecasts, data
-source compatibility verification, IO backend selection, nsteps
-calculation, generating the complete inference script following
-`earth2studio.run.deterministic` structure.
+- `work_items` takes a sequence of `np.datetime64`; omit `members` for a
+  single-member run. `final_lead_time` is a duration, not a step count, and must
+  be a non-negative multiple of the model step. Here 48 h means eight 6 h steps.
+- `"forecast"` is reserved for prognostic output; diagnostic keys name separate
+  streams. Each `output` entry gets its own backend. Omitted streams are not
+  written; omit `"forecast"` to save only diagnostics. `run(items)` returns
+  `None` and handles store planning, flushing, and closing.
+- Diagnostics run before Pipeline's output filtering and regridding. Thus the
+  example saves only three forecast variables while precipitation still receives
+  all 20 inputs. `output_variables` entries filter each stream independently;
+  omitted entries keep all its variables. PrecipitationAFNO outputs `tp06` here;
+  read its actual output signature rather than copying labels from older examples.
+- `regridder={"precipitation": regridder}` regrids that output after variable
+  filtering. Its `source_grid` must match the diagnostic output grid and storage
+  uses its `target_grid`. It does not regrid forecast fields before the diagnostic.
+  Runner input mapping selects variables/domain; it is not interpolation. Choose
+  a compatible diagnostic or explicitly adapt inputs before calling it.
+- For this pair, both streams have leads 0, 6, ..., 48 h. Lead zero is a diagnostic
+  of the initial condition, not a forecast step. `tp06` is a six-hour accumulation
+  at each valid time, not a cumulative total since initialization. In general,
+  the runner publishes the initial condition only when input ends at zero and
+  output contains all input variables on the same grid; otherwise streams start
+  at the first forecast. See `references/troubleshooting.md` for output-only
+  diagnostic inputs and release differences.
 
-**Does not own:** ensemble workflows, diagnostic model chaining,
-data-only fetch (earth2studio-data-fetch),
-installation (earth2studio-install), model training or fine-tuning,
-custom model development.
+For resume, pass `progress=ProgressStore(path)` to `Pipeline.from_model` and reuse
+the full item list and stores; completed items are skipped, interrupted items
+rerun in full. For multi-GPU runs, initialize a process group before `run` and
+follow the [execution specification](../../docs/specs/E2S-11_EXECUTION_CONTRACT_SPEC.md)
+for rank-safe backend creation, distributed writes, and progress tracking.
 
-## Examples
+### 9. Manual loop alternative
 
-**Typical invocation:**
-> "Run a 5-day global forecast with Pangu-Weather starting from
-> today's GFS analysis, saving output to Zarr."
+Only when the user explicitly wants a hand-written loop, follow this order. Read
+the model's base protocol in `earth2studio/models/px/base.py` for the exact
+semantics.
 
-The skill walks through Steps 1-7: confirms requirements, selects Pangu24,
-pairs with GFS data source, picks ZarrBackend, calculates nsteps=5 (24h steps),
-generates the script, and explains how to inspect results.
+1. **Fetch**: `x = fetch_data(source, time, variable, lead_time, device=...)`
+   using the model's declared variable and lead-time labels from `input_coords()`.
+   It returns one DataArray. Pass `target_grid=infer_grid(model.input_coords())`
+   (and a `Regridder` if you want a specific method) when the source grid differs.
+   Validate with `handshake_dataarray`.
+2. **Build the IO template** with `earth2studio.io.utils.output_template(...)`
+   from `model.output_coords(model.input_coords())`, covering every time and lead
+   time to be written, then `io.add_array(template)` once before the loop.
+3. **Iterate**: `for step, y in enumerate(model.create_iterator(x)):`. The first
+   yield is the first forecast, not the initial condition, so write the initial
+   condition separately if you want it stored. Alternatively call
+   `y, state = model.initialize(x)` then `y, state = model.step(y, state=state)`.
+4. **Write**: `io.write(y)` (select variables with `.sel(variable=[...])` first
+   if filtering). Writes locate positions by coordinate label.
+5. **Finish**: call `io.flush()` before reading back and `io.close()` when done.
 
-## Limitations
+Never mutate `x` or `state` in place; forcing is fetched outside the model and
+supplied to `initialize`/`step`.
 
-- Only deterministic (single-member) forecasts; use ensemble workflow for
-  probabilistic runs
-- Cannot train or fine-tune models — inference only
-- Model weights require first-time download (several GB depending on model)
-- Regional models (e.g. StormCast) require matching regional data sources
-- GPU required; CPU-only inference is not supported for most models
+### 10. Explain next steps
+
+- Change forecast time or run several initializations (`Pipeline`)
+- Read the output (`xr.open_zarr(...)`)
+- Add diagnostic postprocessing with Pipeline (section 8)
+- For probabilistic runs, use the ensemble workflow
+
+## Ownership
+
+**Owns:** model selection, data source compatibility, IO backend selection,
+nsteps calculation, diagnostic postprocessing of single-member forecasts,
+generating `deterministic` / `Pipeline` scripts.
+
+**Does not own:** ensembles, standalone diagnostics, data-only fetch
+(`earth2studio-data-fetch`), installation (`earth2studio-install`), model
+training, writing new models.
 
 ## Troubleshooting
 
-| Error | Cause | Solution |
-|-------|-------|----------|
-| `KeyError` on variable | Lexicon missing variable | Check compat; pick different source |
-| `OutOfMemoryError` | VRAM exceeded | Use smaller model or free cache |
-| `FileNotFoundError` package | Weights not cached | Call `load_default_package()` first |
-| `TimeoutError` data fetch | API slow/unreachable | Retry or use cached source |
-| `ValueError: nsteps` | Horizon < model step | Increase horizon or finer model |
+See `references/troubleshooting.md` for common errors and solutions.
+
+## Reminders
+
+- **Read, don't recall.** Models, sources, and signatures change between releases.
+- **Verify lexicon compatibility.** Model input variables must exist in the data
+  source's `VOCAB`.
+- **Use `load_default_package()`** for standard weights loading.
+- **Time format** for `deterministic(time=...)` is ISO 8601 strings, datetimes, or
+  `np.datetime64`.
+- **Wind speed needs both components.** Include `u10m` and `v10m`.
+- **Horizon must be divisible** by the model step; Pipeline takes a duration.
+- **ZarrBackend is the default.** Suggest alternatives only for a specific need.
